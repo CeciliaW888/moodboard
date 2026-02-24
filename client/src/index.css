@@ -19,3 +19,16 @@
     @apply bg-background text-foreground tracking-tight antialiased selection:bg-amber-200 selection:text-amber-900;
   }
 }
+
+@layer utilities {
+  /* Progress bar animation for upload indicator */
+  @keyframes progress {
+    0% { transform: translateX(-100%); }
+    50% { transform: translateX(0%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .animate-progress {
+    animation: progress 1.5s ease-in-out infinite;
+  }
+}

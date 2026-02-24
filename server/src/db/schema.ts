@@ -19,4 +19,5 @@ export const weeks = pgTable("weeks", {
   id: serial("id").primaryKey(),
   weekStr: text("week_str").notNull().unique(), // e.g. "2026-W08"
   notesHeight: integer("notes_height").default(256), // pixels for third row
+  notes: text("notes").default(""), // user notes content
 });

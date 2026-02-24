@@ -21,6 +21,8 @@ export default {
           900: '#78350f',
           950: '#451a03',
         },
+        // Consistent surface color token — replaces hardcoded #f4f4f4
+        surface: '#f4f4f4',
         background: "hsl(var(--background))",
         foreground: "hsl(var(--foreground))",
       }

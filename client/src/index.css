@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 48 100% 98%; /* Warm off-white */
+    --foreground: 20 14% 4%;
+  }
+
+  .dark {
+    --background: 24 10% 10%;
+    --foreground: 60 9% 98%;
+  }
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground tracking-tight antialiased selection:bg-amber-200 selection:text-amber-900;
+  }
+}

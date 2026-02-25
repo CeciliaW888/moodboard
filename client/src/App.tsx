@@ -3,14 +3,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Loader2,
-  Globe,
   LayoutGrid,
   Moon,
   Sun,
   Download,
   Trash2,
-  Plus,
-  ImagePlus,
 } from "lucide-react";
 import {
   format,
@@ -21,11 +18,15 @@ import {
   getISOWeek,
   getYear,
 } from "date-fns";
-import clsx from "clsx";
 import { ResizableNotesArea } from "./components/NotesArea";
 import { ImageCard } from "./components/ImageCard";
+import { InfiniteCanvas } from "./components/InfiniteCanvas";
+import { ColorExtractor } from "./components/ColorExtractor";
 import { useToast } from "./components/Toast";
 import { useLocalStorage } from "./hooks/useLocalStorage";
+import { useDebouncedSave } from "./hooks/useDebouncedSave";
+import { CalendarDropdown } from "./components/CalendarDropdown";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { api, BoardImage } from "./api";
 
 function App() {
@@ -33,14 +34,18 @@ function App() {
   const [images, setImages] = useState<BoardImage[]>([]);
   const [notesHeight, setNotesHeight] = useState(256);
   const [notes, setNotes] = useState("");
-  const [uploadingDay, setUploadingDay] = useState<number | null>(null);
-  const [dragOverDay, setDragOverDay] = useState<number | null>(null);
+  const [uploading, setUploading] = useState(false);
   const [language, setLanguage] = useLocalStorage<"zh" | "en">("moodboard-language", "zh");
   const [isDarkMode, setIsDarkMode] = useLocalStorage("moodboard-dark-mode", false);
-  const [confirmClear, setConfirmClear] = useState(false);
+  const [showClearDialog, setShowClearDialog] = useState(false);
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [isRetagging, setIsRetagging] = useState(false);
+  const [zIndexMap, setZIndexMap] = useState<{ counter: number; map: Record<number, number> }>({ counter: 1, map: {} });
+  const [colorExtractId, setColorExtractId] = useState<number | null>(null);
+  const [expandedImageId, setExpandedImageId] = useState<number | null>(null);
   const { showToast } = useToast();
 
-  // Sync dark mode class with persisted state
+  // Sync dark mode class
   useEffect(() => {
     if (isDarkMode) {
       document.documentElement.classList.add("dark");
@@ -49,17 +54,37 @@ function App() {
     }
   }, [isDarkMode]);
 
-  const toggleDarkMode = () => {
-    setIsDarkMode((prev) => !prev);
+  const toggleDarkMode = () => setIsDarkMode((prev) => !prev);
+
+  const toggleLanguage = async () => {
+    const newLang = language === "en" ? "zh" : "en";
+    setLanguage(newLang);
+
+    if (images.length === 0) return;
+
+    setIsRetagging(true);
+    try {
+      const updated = await Promise.all(
+        images.map(async (img) => {
+          try {
+            const result = await api.retagImage(img.id, newLang);
+            return { ...img, tags: result.tags };
+          } catch {
+            return img;
+          }
+        })
+      );
+      setImages(updated);
+      showToast(`Tags updated to ${newLang === "en" ? "English" : "Chinese"}`, "success");
+    } catch {
+      showToast("Failed to update some tags", "error");
+    } finally {
+      setIsRetagging(false);
+    }
   };
 
   const handleClearWeek = async () => {
-    if (!confirmClear) {
-      setConfirmClear(true);
-      setTimeout(() => setConfirmClear(false), 3000);
-      return;
-    }
-    setConfirmClear(false);
+    setShowClearDialog(false);
     try {
       await api.clearWeek(weekStr);
       setImages([]);
@@ -69,7 +94,6 @@ function App() {
     }
   };
 
-  // Derive week string (e.g. 2026-W08)
   const weekStr = `${getYear(currentDate)}-W${getISOWeek(currentDate).toString().padStart(2, "0")}`;
 
   const fetchWeekData = useCallback(async () => {
@@ -78,6 +102,7 @@ function App() {
       setNotesHeight(data.week?.notesHeight || 256);
       setNotes(data.week?.notes || "");
       setImages(data.images || []);
+      setZIndexMap({ counter: 1, map: {} });
     } catch (e) {
       showToast("Failed to load week data", "error");
     }
@@ -87,100 +112,78 @@ function App() {
     fetchWeekData();
   }, [fetchWeekData]);
 
-  useEffect(() => {
-    const handleGlobalPaste = async (e: ClipboardEvent) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
+  // Debounced position save
+  const savePosition = useCallback(
+    (id: number, pos: { x?: number; y?: number; width?: number; height?: number }) => {
+      api.updateImagePosition(id, pos).catch(() => {
+        showToast("Failed to save position", "error");
+      });
+    },
+    []
+  );
+  const { debouncedFn: debouncedSavePosition } = useDebouncedSave(savePosition, 300);
 
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        if (item.kind === "file" || item.type.startsWith("image/") || item.type.startsWith("video/")) {
-          const file = item.getAsFile();
-          if (file) {
-            e.preventDefault();
-            const dayOfWeek = currentDayFallback(dragOverDay ?? undefined);
-            setUploadingDay(dayOfWeek);
-            try {
-              const result = await api.uploadImage(weekStr, dayOfWeek, file, language);
-              setImages((prev) => [...prev, result.image]);
-              showToast("Image uploaded", "success");
-            } catch (err: any) {
-              showToast(err?.message || "Upload failed", "error");
-            } finally {
-              setUploadingDay(null);
-            }
-            return; // Process only the first valid file
-          }
-        }
-      }
-    };
-
-    window.addEventListener("paste", handleGlobalPaste);
-    return () => window.removeEventListener("paste", handleGlobalPaste);
-  }, [weekStr, currentDate, dragOverDay, language]);
-
-  const handleDrop = async (e: React.DragEvent, dayIndex: number) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOverDay(null);
-
-    const files = e.dataTransfer.files;
-    if (!files || files.length === 0) return;
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file.type.startsWith("image/") || file.type.startsWith("video/")) {
-        setUploadingDay(dayIndex);
-        try {
-          const result = await api.uploadImage(weekStr, dayIndex, file, language);
-          setImages((prev) => [...prev, result.image]);
-          showToast("Image uploaded", "success");
-        } catch (err: any) {
-          showToast(err?.message || "Upload failed", "error");
-        } finally {
-          setUploadingDay(null);
-        }
+  const handleUploadFile = useCallback(
+    async (file: File, canvasX: number, canvasY: number) => {
+      if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) {
+        showToast("Unsupported file type. Use images or videos.", "info");
         return;
       }
-    }
-    showToast("Unsupported file type. Use images or videos.", "info");
+
+      setUploading(true);
+      try {
+        const result = await api.uploadImage(weekStr, 1, file, language, {
+          x: Math.round(canvasX),
+          y: Math.round(canvasY),
+        });
+        setImages((prev) => [...prev, result.image]);
+        showToast("Image uploaded", "success");
+      } catch (err: any) {
+        showToast(err?.message || "Upload failed", "error");
+      } finally {
+        setUploading(false);
+      }
+    },
+    [weekStr, language]
+  );
+
+  const handleBringToFront = useCallback((id: number) => {
+    setZIndexMap((prev) => {
+      const next = prev.counter + 1;
+      return { counter: next, map: { ...prev.map, [id]: next } };
+    });
+  }, []);
+
+  const handlePositionChange = useCallback(
+    (id: number, pos: { x: number; y: number; width: number; height: number }) => {
+      setImages((prev) =>
+        prev.map((img) => (img.id === id ? { ...img, ...pos } : img))
+      );
+      debouncedSavePosition(id, pos);
+    },
+    [debouncedSavePosition]
+  );
+
+  const handleRemoveTag = (imageId: number, tagId: number) => {
+    setImages((prev) =>
+      prev.map((img) =>
+        img.id === imageId
+          ? { ...img, tags: img.tags.filter((t) => t.id !== tagId) }
+          : img
+      )
+    );
   };
 
-  const handleDragOver = (e: React.DragEvent, dayIndex: number) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOverDay(dayIndex);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOverDay(null);
-  };
-
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>, dayIndex?: number) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    const dayOfWeek = currentDayFallback(dayIndex);
-    setUploadingDay(dayOfWeek);
-
+  const handleDeleteImage = async (id: number) => {
     try {
-      const result = await api.uploadImage(weekStr, dayOfWeek, file, language);
-      setImages((prev) => [...prev, result.image]);
-      showToast("Image uploaded", "success");
-    } catch (err: any) {
-      showToast(err?.message || "Upload failed", "error");
-    } finally {
-      setUploadingDay(null);
-      // Reset input value so same file can be selected again
-      if (event.target) event.target.value = "";
+      await api.deleteImage(id);
+      setImages((prev) => prev.filter((img) => img.id !== id));
+      if (colorExtractId === id) setColorExtractId(null);
+      if (expandedImageId === id) setExpandedImageId(null);
+      showToast("Image deleted", "success");
+    } catch (e) {
+      showToast("Failed to delete image", "error");
     }
-  };
-
-  const currentDayFallback = (dayIndex?: number) => {
-    if (dayIndex !== undefined && dayIndex >= 1) return dayIndex;
-    const dayOfWeek = currentDate.getDay(); // 0=Sun, 1=Mon...
-    return dayOfWeek === 0 ? 7 : dayOfWeek;
   };
 
   const handleNotesHeightChange = async (h: number) => {
@@ -197,176 +200,83 @@ function App() {
     });
   };
 
-  const handleRemoveTag = (imageId: number, tagId: number) => {
-    setImages((prev) =>
-      prev.map((img) =>
-        img.id === imageId
-          ? { ...img, tags: img.tags.filter((t) => t.id !== tagId) }
-          : img
-      )
-    );
-  };
+  const weekStart = startOfWeek(currentDate, { weekStartsOn: 1 });
 
-  const handleDeleteImage = async (id: number) => {
-    try {
-      await api.deleteImage(id);
-      setImages((prev) => prev.filter((img) => img.id !== id));
-      showToast("Image deleted", "success");
-    } catch (e) {
-      showToast("Failed to delete image", "error");
-    }
-  };
+  const expandedImage = expandedImageId
+    ? images.find((img) => img.id === expandedImageId) || null
+    : null;
 
-  const weekStart = startOfWeek(currentDate, { weekStartsOn: 1 }); // Monday
-
-  // Group images by day
-  const groupedImages = images.reduce<{ [key: number]: BoardImage[] }>(
-    (acc, img) => {
-      if (!acc[img.dayOfWeek]) acc[img.dayOfWeek] = [];
-      acc[img.dayOfWeek].push(img);
-      return acc;
-    },
-    {}
-  );
-
-  const renderDayCell = (dayIndex: number, label?: string) => {
-    const dayImages = groupedImages[dayIndex] || [];
-    const dateObj = addDays(weekStart, dayIndex - 1);
-    const dateNum = format(dateObj, "d");
-    const dayLabel = label || format(dateObj, "EEE").toUpperCase();
-    const isDragTarget = dragOverDay === dayIndex;
-    const isUploadingHere = uploadingDay === dayIndex;
-
-    return (
-      <div
-        key={dayIndex}
-        onMouseEnter={() => setDragOverDay(null)}
-        onDragOver={(e) => handleDragOver(e, dayIndex)}
-        onDragLeave={handleDragLeave}
-        onDrop={(e) => handleDrop(e, dayIndex)}
-        className={clsx(
-          "relative flex flex-col gap-4 overflow-y-auto mix-blend-normal px-2 h-full rounded-lg transition-colors duration-200",
-          isDragTarget && "bg-amber-50/50 dark:bg-amber-950/20 ring-2 ring-amber-300 dark:ring-amber-600 ring-inset"
-        )}
-      >
-        <div className="flex flex-col items-center sticky top-0 bg-surface dark:bg-neutral-900 z-10 pb-6 pt-2">
-          <span className="text-2xl font-light text-stone-700 dark:text-stone-300 leading-none">
-            {dateNum}
-          </span>
-          <span className="text-[10px] font-bold tracking-widest uppercase text-stone-500 dark:text-stone-400 mt-1">
-            {dayLabel}
-          </span>
-        </div>
-
-        {/* Render Cards */}
-        <div className="flex flex-col gap-4 pb-4">
-          {dayImages.map((img) => (
-            <ImageCard
-              key={img.id}
-              image={img}
-              onRemoveTag={handleRemoveTag}
-              onDelete={handleDeleteImage}
-            />
-          ))}
-
-          {/* Upload area / empty state */}
-          {dayImages.length === 0 && !isUploadingHere ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-              <ImagePlus className="w-8 h-8 text-stone-300 dark:text-neutral-600 mb-2" strokeWidth={1} />
-              <p className="text-xs text-stone-400 dark:text-stone-500 mb-1">
-                Drop image here
-              </p>
-              <label className="text-xs text-stone-500 dark:text-stone-400 hover:text-amber-600 dark:hover:text-amber-400 cursor-pointer underline underline-offset-2 transition-colors">
-                or browse
-                <input
-                  type="file"
-                  className="hidden"
-                  accept="image/*,video/*"
-                  onChange={(e) => handleFileUpload(e, dayIndex)}
-                />
-              </label>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center justify-center p-4 border border-dashed border-transparent hover:border-stone-300 dark:hover:border-neutral-700 rounded-lg text-stone-500 text-xs text-center relative mt-2 group transition-colors">
-              {isUploadingHere ? (
-                <Loader2 className="w-5 h-5 animate-spin text-amber-500" />
-              ) : (
-                <label className="flex items-center gap-1 opacity-0 group-hover:opacity-100 cursor-pointer text-stone-500 hover:text-stone-700 dark:text-stone-400 dark:hover:text-stone-200 transition-all">
-                  <Plus className="w-4 h-4" />
-                  Add Image
-                  <input
-                    type="file"
-                    className="hidden"
-                    accept="image/*,video/*"
-                    onChange={(e) => handleFileUpload(e, dayIndex)}
-                  />
-                </label>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  };
+  const colorExtractImage = colorExtractId
+    ? images.find((img) => img.id === colorExtractId) || null
+    : null;
 
   return (
-    <div className="h-screen w-full flex flex-col font-sans bg-surface dark:bg-neutral-900 selection:bg-stone-200 selection:text-stone-900 overflow-hidden relative">
-      {/* Navbar / Header */}
-      <header className="flex items-center justify-between px-8 py-5 sticky top-0 z-50 bg-surface dark:bg-neutral-900">
-        <div className="flex items-center gap-4 text-stone-800 dark:text-stone-200">
-          <h1 className="text-xl font-light tracking-tight flex items-center gap-2 text-stone-500">
+    <div className="h-screen w-full flex flex-col font-sans bg-surface dark:bg-neutral-900 selection:bg-neutral-200 selection:text-neutral-900 relative overflow-hidden">
+      {/* Navbar */}
+      <header className="flex items-center justify-between px-8 py-3 z-50 bg-white/80 dark:bg-neutral-900/80 backdrop-blur-md border-b border-neutral-200/50 dark:border-neutral-800/50 shrink-0">
+        <div className="flex items-center gap-4 text-neutral-900 dark:text-stone-200">
+          <h1 className="text-xl font-semibold tracking-tight flex items-center gap-2 text-neutral-900 dark:text-stone-200">
             Week
-            <strong className="font-medium text-stone-800 dark:text-stone-200">
+            <strong className="font-semibold">
               {getISOWeek(currentDate)}
             </strong>
           </h1>
-          <div className="w-px h-4 bg-stone-300 dark:bg-stone-700" />
-          <span className="text-sm font-medium text-stone-500 dark:text-stone-400">
+          <div className="w-px h-4 bg-neutral-300 dark:bg-stone-700" />
+          <span className="text-sm font-semibold text-neutral-500 dark:text-stone-400">
             {format(weekStart, "MMMM d")} -{" "}
             {format(addDays(weekStart, 6), "d")}
           </span>
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Elegant Today Navigation */}
-          <div className="flex items-center bg-white dark:bg-neutral-800 rounded-full shadow-sm border border-stone-200 dark:border-neutral-700 h-8">
+          <div className="relative flex items-center bg-white dark:bg-neutral-800 rounded-sm shadow-sm border border-neutral-200 dark:border-neutral-700 h-8">
             <button
               onClick={() => setCurrentDate(subWeeks(currentDate, 1))}
-              className="px-2 text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors h-full rounded-l-full"
+              className="px-2 text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors h-full rounded-l-sm"
               aria-label="Previous week"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
             <button
-              className="px-3 text-[11px] font-bold uppercase tracking-widest text-stone-600 dark:text-stone-300 hover:text-stone-900 border-x border-stone-200 dark:border-stone-700 h-full flex items-center bg-stone-50 dark:bg-neutral-800/50"
-              onClick={() => setCurrentDate(new Date())}
-              aria-label="Go to current week"
+              className="px-3 text-[11px] font-semibold uppercase tracking-widest text-neutral-600 dark:text-stone-300 hover:text-neutral-900 border-x border-neutral-200 dark:border-stone-700 h-full flex items-center bg-neutral-50 dark:bg-neutral-800/50"
+              onClick={() => setCalendarOpen((prev) => !prev)}
+              aria-label="Open calendar"
             >
               Today
             </button>
             <button
               onClick={() => setCurrentDate(addWeeks(currentDate, 1))}
-              className="px-2 text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors h-full rounded-r-full"
+              className="px-2 text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors h-full rounded-r-sm"
               aria-label="Next week"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
+            {calendarOpen && (
+              <CalendarDropdown
+                currentDate={currentDate}
+                onSelectDate={(date) => {
+                  setCurrentDate(date);
+                  setCalendarOpen(false);
+                }}
+                onClose={() => setCalendarOpen(false)}
+              />
+            )}
           </div>
         </div>
       </header>
 
       {/* Right Floating Action Bar */}
       <div className="fixed right-8 top-1/2 -translate-y-1/2 flex flex-col items-center z-40 max-md:right-2 max-md:top-auto max-md:bottom-4 max-md:translate-y-0 max-md:flex-row max-md:right-auto max-md:left-1/2 max-md:-translate-x-1/2">
-        <div className="flex flex-col max-md:flex-row items-center gap-5 max-md:gap-3 bg-white/90 dark:bg-neutral-800/90 backdrop-blur-md shadow-xl border border-stone-200/50 dark:border-neutral-700/50 rounded-[32px] max-md:rounded-full p-2.5 py-6 max-md:py-2.5 max-md:px-6 w-14 max-md:w-auto max-md:h-14">
+        <div className="flex flex-col max-md:flex-row items-center gap-5 max-md:gap-3 bg-white/50 dark:bg-neutral-800/50 backdrop-blur-xl shadow-lg border border-neutral-200/30 dark:border-neutral-700/50 rounded-sm max-md:rounded-sm p-2.5 py-6 max-md:py-2.5 max-md:px-6 w-14 max-md:w-auto max-md:h-14">
           <button
-            className="text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors group relative"
+            className="text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors group relative"
             aria-label="Grid view"
           >
             <LayoutGrid className="w-[22px] h-[22px]" strokeWidth={1.5} />
           </button>
 
           <button
-            className="text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors group relative"
+            className="text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors group relative"
             onClick={toggleDarkMode}
             aria-label={isDarkMode ? "Switch to light mode" : "Switch to dark mode"}
           >
@@ -378,71 +288,72 @@ function App() {
           </button>
 
           <button
-            className="text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors group relative"
+            className="text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors group relative"
             aria-label="Export"
           >
             <Download className="w-[22px] h-[22px]" strokeWidth={1.5} />
           </button>
 
-          <div className="w-8 max-md:w-px max-md:h-8 border-b max-md:border-b-0 max-md:border-r border-stone-100 dark:border-neutral-700/60 my-0.5 max-md:mx-0.5" />
+          <div className="w-8 max-md:w-px max-md:h-8 border-b max-md:border-b-0 max-md:border-r border-neutral-200/40 dark:border-neutral-700/60 my-0.5 max-md:mx-0.5" />
 
           <button
-            className="text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 transition-colors group relative"
-            onClick={() =>
-              setLanguage((l) => (l === "en" ? "zh" : "en"))
-            }
+            className="text-neutral-500 hover:text-neutral-900 dark:hover:text-stone-200 transition-colors group relative flex items-center justify-center w-[22px] h-[22px]"
+            onClick={toggleLanguage}
+            disabled={isRetagging}
             aria-label={language === "zh" ? "Switch to English" : "Switch to Chinese"}
           >
-            <Globe className="w-[22px] h-[22px]" strokeWidth={1.5} />
-            <span className="absolute right-full max-md:right-auto max-md:bottom-full mr-3 max-md:mr-0 max-md:mb-3 bg-stone-800 text-white text-[10px] px-2 py-1 flex items-center h-6 rounded shadow-lg opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity">
+            {isRetagging ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <span className="text-[11px] font-bold uppercase leading-none">{language === "zh" ? "中" : "EN"}</span>
+            )}
+            <span className="absolute right-full max-md:right-auto max-md:bottom-full mr-3 max-md:mr-0 max-md:mb-3 bg-neutral-800 text-white text-[10px] px-2 py-1 flex items-center h-6 rounded shadow-lg opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity">
               {language === "zh" ? "Switch to English" : "Switch to Chinese"}
             </span>
           </button>
 
-          <div className="w-8 max-md:w-px max-md:h-8 border-b max-md:border-b-0 max-md:border-r border-stone-100 dark:border-neutral-700/60 my-0.5 max-md:mx-0.5" />
+          <div className="w-8 max-md:w-px max-md:h-8 border-b max-md:border-b-0 max-md:border-r border-neutral-200/40 dark:border-neutral-700/60 my-0.5 max-md:mx-0.5" />
 
           <button
             className="text-red-400/80 hover:text-red-600 dark:hover:text-red-500 transition-colors group relative"
-            onClick={handleClearWeek}
-            aria-label={confirmClear ? "Click again to confirm clearing the week" : "Clear all images from this week"}
+            onClick={() => setShowClearDialog(true)}
+            aria-label="Clear all images from this week"
           >
             <Trash2 className="w-[22px] h-[22px]" strokeWidth={1.5} />
             <span className="absolute right-full max-md:right-auto max-md:bottom-full mr-3 max-md:mr-0 max-md:mb-3 bg-red-600 text-white text-[10px] px-2 py-1 flex items-center h-6 rounded shadow-lg opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity">
-              {confirmClear ? "Click again to confirm" : "Clear Week"}
+              Clear Week
             </span>
           </button>
         </div>
       </div>
 
-      {/* Board Area */}
-      <main
-        className="flex-1 p-6 flex flex-col gap-6 overflow-hidden"
-        style={{ paddingBottom: `${notesHeight + 24}px` }}
-      >
-        {/* Progress bar / loader */}
-        {uploadingDay !== null && (
-          <div className="fixed top-0 left-0 right-0 h-1 bg-amber-100 dark:bg-amber-950 z-[100] overflow-hidden">
-            <div className="h-full bg-amber-500 w-full animate-progress" />
-          </div>
-        )}
-
-        {/* Row 1: Mon, Tue, Wed */}
-        <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-6 min-h-0">
-          {renderDayCell(1)}
-          {renderDayCell(2)}
-          {renderDayCell(3)}
-        </div>
-
-        {/* Row 2: Thu, Fri, Weekend (Sat + Sun) */}
-        <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-6 min-h-0">
-          {renderDayCell(4)}
-          {renderDayCell(5)}
-          <div className="grid grid-cols-2 gap-2 h-full">
-            {renderDayCell(6, "SAT")}
-            {renderDayCell(7, "SUN")}
+      {/* Upload overlay */}
+      {uploading && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center pointer-events-none">
+          <div className="bg-white/90 dark:bg-neutral-800/90 backdrop-blur-md rounded-lg shadow-2xl border border-neutral-200/50 dark:border-neutral-700/50 px-8 py-6 flex flex-col items-center gap-3 pointer-events-auto">
+            <Loader2 className="w-8 h-8 animate-spin text-neutral-700 dark:text-stone-300" />
+            <span className="text-sm font-medium text-neutral-700 dark:text-stone-300">
+              Uploading & analyzing...
+            </span>
+            <div className="w-32 h-1.5 bg-neutral-200 dark:bg-neutral-700 rounded-full overflow-hidden">
+              <div className="h-full bg-neutral-800 dark:bg-amber-500 w-full animate-progress rounded-full" />
+            </div>
           </div>
         </div>
-      </main>
+      )}
+
+      {/* Infinite Canvas */}
+      <InfiniteCanvas
+        images={images}
+        zIndexMap={zIndexMap.map}
+        onBringToFront={handleBringToFront}
+        onPositionChange={handlePositionChange}
+        onRemoveTag={handleRemoveTag}
+        onDelete={handleDeleteImage}
+        onExtractColors={(id) => setColorExtractId(id)}
+        onExpand={(id) => setExpandedImageId(id)}
+        onUploadFile={handleUploadFile}
+      />
 
       {/* Notes Area */}
       <ResizableNotesArea
@@ -451,6 +362,37 @@ function App() {
         notes={notes}
         onNotesChange={handleNotesChange}
       />
+
+      {/* Color Extractor Panel */}
+      {colorExtractImage && (
+        <ColorExtractor
+          image={colorExtractImage}
+          onClose={() => setColorExtractId(null)}
+        />
+      )}
+
+      {/* Expanded Image Modal */}
+      {expandedImage && (
+        <ImageCard
+          image={expandedImage}
+          onRemoveTag={handleRemoveTag}
+          onDelete={handleDeleteImage}
+          forceExpanded
+          onClose={() => setExpandedImageId(null)}
+        />
+      )}
+
+      {/* Clear Week Confirmation */}
+      {showClearDialog && (
+        <ConfirmDialog
+          title="Clear week"
+          message="This will delete all images from this week. Are you sure?"
+          confirmLabel="Clear All"
+          variant="danger"
+          onConfirm={handleClearWeek}
+          onCancel={() => setShowClearDialog(false)}
+        />
+      )}
     </div>
   );
 }

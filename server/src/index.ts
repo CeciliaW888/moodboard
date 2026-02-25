@@ -5,7 +5,8 @@ import path from 'path';
 import fs from 'fs';
 import { db } from './db';
 import { images, terminologyTags, weeks } from './db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
+import { setISOWeek, setISODay, getYear as dfGetYear, getMonth, format as dfFormat, parseISO } from 'date-fns';
 import { generateTerminologyFromMedia } from './services/gemini';
 
 const app = express();
@@ -117,22 +118,67 @@ app.patch('/api/weeks/:weekStr', async (req, res) => {
   res.json({ success: true });
 });
 
+// Get dates that have images for a given month
+app.get('/api/images/dates', async (req, res) => {
+  const month = req.query.month as string; // Expected format: YYYY-MM
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+    return res.status(400).json({ error: 'Invalid month format. Expected YYYY-MM' });
+  }
+
+  const [yearStr, monthStr] = month.split('-');
+  const targetYear = parseInt(yearStr, 10);
+  const targetMonth = parseInt(monthStr, 10) - 1; // 0-indexed for comparison
+
+  try {
+    // Get all distinct (weekStr, dayOfWeek) pairs that have images
+    const rows = await db
+      .select({ weekStr: images.weekStr, dayOfWeek: images.dayOfWeek })
+      .from(images)
+      .groupBy(images.weekStr, images.dayOfWeek);
+
+    const dates: string[] = [];
+    for (const row of rows) {
+      const weekMatch = row.weekStr.match(/^(\d{4})-W(\d{2})$/);
+      if (!weekMatch) continue;
+
+      const wYear = parseInt(weekMatch[1], 10);
+      const wNum = parseInt(weekMatch[2], 10);
+
+      // Build the actual date from ISO week + day
+      let d = new Date(wYear, 0, 4); // Jan 4 is always in ISO week 1
+      d = setISOWeek(d, wNum);
+      d = setISODay(d, row.dayOfWeek ?? 1);
+
+      if (dfGetYear(d) === targetYear && getMonth(d) === targetMonth) {
+        dates.push(dfFormat(d, 'yyyy-MM-dd'));
+      }
+    }
+
+    // Deduplicate (multiple images on same day)
+    const uniqueDates = [...new Set(dates)].sort();
+    res.json({ dates: uniqueDates });
+  } catch (err) {
+    console.error('Error fetching image dates:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Upload image and get AI terminology
 app.post('/api/images', upload.single('image'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No image provided' });
   }
 
-  const { weekStr, dayOfWeek, language } = req.body;
-  if (!weekStr || !dayOfWeek) {
-     return res.status(400).json({ error: 'Missing week object data' });
+  const { weekStr, dayOfWeek, language, x, y, width, height } = req.body;
+  if (!weekStr) {
+     return res.status(400).json({ error: 'Missing weekStr' });
   }
 
   if (!isValidWeekStr(weekStr)) {
     return res.status(400).json({ error: 'Invalid weekStr format' });
   }
 
-  const day = parseInt(dayOfWeek, 10);
+  const day = dayOfWeek ? parseInt(dayOfWeek, 10) : 1;
   if (isNaN(day) || day < 1 || day > 7) {
     return res.status(400).json({ error: 'dayOfWeek must be between 1 and 7' });
   }
@@ -147,6 +193,10 @@ app.post('/api/images', upload.single('image'), async (req, res) => {
       url: imageUrl,
       weekStr,
       dayOfWeek: day,
+      x: x ? parseInt(x, 10) : 0,
+      y: y ? parseInt(y, 10) : 0,
+      width: width ? parseInt(width, 10) : 280,
+      height: height ? parseInt(height, 10) : 0,
     }).returning();
 
     // 2. Call Gemini API
@@ -170,6 +220,82 @@ app.post('/api/images', upload.single('image'), async (req, res) => {
   } catch (err) {
      console.error(err);
      res.status(500).json({ error: 'Failed to process image' });
+  }
+});
+
+// Update image canvas position/size
+app.patch('/api/images/:id/position', async (req, res) => {
+  try {
+    const imageId = parseInt(req.params.id, 10);
+    if (isNaN(imageId)) return res.status(400).json({ error: 'Invalid ID' });
+
+    const { x, y, width, height } = req.body;
+    const updates: Record<string, any> = {};
+
+    // Round to integers — react-rnd sends floats, but DB columns are integer
+    if (x !== undefined && x !== null) updates.x = Math.round(Number(x));
+    if (y !== undefined && y !== null) updates.y = Math.round(Number(y));
+    if (width !== undefined && width !== null) updates.width = Math.round(Number(width));
+    if (height !== undefined && height !== null) updates.height = Math.round(Number(height));
+
+    // Guard against NaN from bad input
+    for (const key of Object.keys(updates)) {
+      if (isNaN(updates[key])) delete updates[key];
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await db.update(images).set(updates).where(eq(images.id, imageId));
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error updating image position:', err);
+    res.status(500).json({ error: 'Failed to update position' });
+  }
+});
+
+// Re-extract tags for an image in a different language
+app.post('/api/images/:id/retag', async (req, res) => {
+  try {
+    const imageId = parseInt(req.params.id, 10);
+    if (isNaN(imageId)) return res.status(400).json({ error: 'Invalid ID' });
+
+    const { language } = req.body;
+    if (!language) return res.status(400).json({ error: 'Missing language' });
+
+    const image = await db.query.images.findFirst({
+      where: eq(images.id, imageId),
+    });
+    if (!image) return res.status(404).json({ error: 'Image not found' });
+
+    const localPath = path.join(uploadDir, path.basename(image.url));
+    if (!fs.existsSync(localPath)) {
+      return res.status(404).json({ error: 'Image file not found on disk' });
+    }
+
+    const ext = path.extname(localPath).toLowerCase();
+    const mimeMap: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.mp4': 'video/mp4',
+      '.webm': 'video/webm', '.mov': 'video/quicktime', '.ogg': 'video/ogg',
+    };
+    const mimeType = mimeMap[ext] || 'image/png';
+
+    // Delete old tags
+    await db.delete(terminologyTags).where(eq(terminologyTags.imageId, imageId));
+
+    // Re-extract with new language
+    const terms = await generateTerminologyFromMedia(mimeType, localPath, language);
+
+    let insertedTags: any[] = [];
+    if (terms.length > 0) {
+      const tagsToInsert = terms.map(term => ({ imageId, term }));
+      insertedTags = await db.insert(terminologyTags).values(tagsToInsert).returning();
+    }
+
+    res.json({ tags: insertedTags });
+  } catch (err) {
+    console.error('Error re-tagging image:', err);
+    res.status(500).json({ error: 'Failed to re-extract tags' });
   }
 });
 

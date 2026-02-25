@@ -7,6 +7,9 @@ export default {
   darkMode: 'class',
   theme: {
     extend: {
+      fontFamily: {
+        sans: ['"Virgil"', '"Segoe Print"', '"Comic Neue"', 'cursive'],
+      },
       colors: {
         amber: {
           50: '#fffbeb',
@@ -21,8 +24,7 @@ export default {
           900: '#78350f',
           950: '#451a03',
         },
-        // Consistent surface color token — replaces hardcoded #f4f4f4
-        surface: '#f4f4f4',
+        surface: '#ffffff',
         background: "hsl(var(--background))",
         foreground: "hsl(var(--foreground))",
       }

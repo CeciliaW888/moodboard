@@ -1,11 +1,19 @@
+@font-face {
+  font-family: 'Virgil';
+  src: url('https://unpkg.com/@excalidraw/excalidraw/dist/excalidraw-assets/Virgil.woff2') format('woff2');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
   :root {
-    --background: 48 100% 98%; /* Warm off-white */
-    --foreground: 20 14% 4%;
+    --background: 0 0% 100%; /* #ffffff — Excalidraw white */
+    --foreground: 0 0% 12%; /* #1e1e1e */
   }
 
   .dark {
@@ -16,7 +24,7 @@
 
 @layer base {
   body {
-    @apply bg-background text-foreground tracking-tight antialiased selection:bg-amber-200 selection:text-amber-900;
+    @apply bg-background text-foreground tracking-tight antialiased selection:bg-neutral-200 selection:text-neutral-900;
   }
 }
 
@@ -31,4 +39,21 @@
   .animate-progress {
     animation: progress 1.5s ease-in-out infinite;
   }
+}
+
+.canvas-dotgrid {
+  background-color: #1a1a1a;
+  background-image: radial-gradient(circle, #333 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.dark .canvas-dotgrid {
+  background-color: #111;
+  background-image: radial-gradient(circle, #282828 1px, transparent 1px);
+}
+
+/* Light mode canvas */
+:root:not(.dark) .canvas-dotgrid {
+  background-color: #f5f5f4;
+  background-image: radial-gradient(circle, #d4d4d4 1px, transparent 1px);
 }

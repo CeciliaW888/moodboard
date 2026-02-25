@@ -4,7 +4,11 @@ export const images = pgTable("images", {
   id: serial("id").primaryKey(),
   url: text("url").notNull(),
   weekStr: text("week_str").notNull(), // e.g. "2026-W08"
-  dayOfWeek: integer("day_of_week").notNull(), // 1 for Mon, 2 for Tue... 7 for Sun
+  dayOfWeek: integer("day_of_week").default(1),
+  x: integer("x").default(0),
+  y: integer("y").default(0),
+  width: integer("width").default(280),
+  height: integer("height").default(0), // 0 = auto/aspect-ratio
   createdAt: timestamp("created_at").defaultNow(),
 });
 
